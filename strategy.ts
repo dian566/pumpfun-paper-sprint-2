@@ -108,8 +108,11 @@ export interface Params {
 // tight stops cap the downside on a bad final window; the dip entries keep a
 // real shot at net PnL > 0. Pacing re-scaled here for the 6-hour final:
 // paceSecs 21600 and targetFills 60 (was 86400 / 200 for 24 hours).
+// The dip window was re-swept for this competition (8 more variants on the
+// same dev window): a wider 80-slot window with shallower dips (5-30%)
+// won at -0.117 SOL, 92 coins, 139 round trips, 1.5% drawdown.
 export const DEFAULT_PARAMS: Params = {
-  window: 40,
+  window: 80,
   minNetSol: 1,
   minBuys: 6,
   minBuyers: 6,
@@ -143,8 +146,8 @@ export const DEFAULT_PARAMS: Params = {
   probeSol: 0.012,
   maxProbes: 1,
   dip: true,
-  dipMinDown: 0.1,
-  dipMaxDown: 0.35,
+  dipMinDown: 0.05,
+  dipMaxDown: 0.3,
 };
 
 const LAMPORTS = 1e9;

@@ -27,11 +27,11 @@ because a 24-hour pacing clock would only reach 25% by the end of a
 
 ## Entry (default: dip mode)
 
-On every batch, for each curve that traded, the bot checks a 40-slot tape:
+On every batch, for each curve that traded, the bot checks an 80-slot tape:
 
 - curve at least 200 slots old,
 - real SOL reserves between 2 and 60,
-- price down 10–35% over the window, with buy flow returning: net SOL in
+- price down 5–30% over the window, with buy flow returning: net SOL in
   the newer half of the window positive and above the older half's,
 - ≥ 6 buy trades and ≥ 6 distinct buyers in the window,
 - no single buyer above 50% of the window's buy SOL.
@@ -74,10 +74,11 @@ covers the bar most of the way, so probes fire rarely.
 ## Dev-window results
 
 The parameter set was chosen by sweeping 19 variants on the kit's dev
-window (24h, 2–3 Nov 2026) for the sister competition; the same dev window
-ships in this kit. The window is a down market: every genuine strategy
-lost money on it, and the chosen dip-tight set lost least (−0.14 SOL,
-1.4% drawdown, 103 round trips, guardrail met). The final window is a
-fresh 6 hours after the deadline, so the dev score is a robustness check,
-not a forecast — the entry's edge is a tight stop plus a real shot at a
-bounce winner, not a dev-window fit.
+window (24h, 2–3 Nov 2026) for the sister competition, then re-swept with
+8 more variants for this one; the same dev window ships in this kit. The
+window is a down market: every genuine strategy lost money on it, and the
+chosen set lost least (−0.117 SOL, 1.5% drawdown, 139 round trips over 92
+coins, guardrail met). The final window is a fresh 6 hours after the
+deadline, so the dev score is a robustness check, not a forecast — the
+entry's edge is a tight stop plus a real shot at a bounce winner, not a
+dev-window fit.
