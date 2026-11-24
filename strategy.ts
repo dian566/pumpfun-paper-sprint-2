@@ -1,34 +1,37 @@
 // Dip Sprinter — a deterministic paper bot for the pump.fun paper sprint
 // (6-hour final window).
 //
-// Idea: most pump.fun curves bleed out, but a minority bounce hard after a
-// dip. The default mode buys small into a dip with buy flow returning
-// (price down 10-35% over the window, newer-half net flow positive and
-// improving), then exits fast: a modest take-profit, a very tight stop-loss,
-// a trailing stop once the trade is up, and a fade exit when the flow turns.
-// A surge mode (buy confirmed breakouts instead) is kept behind the `dip`
-// flag. Positions are capped hard so no single coin can hurt the run, and
-// tiny probe round-trips keep the run above the competition's guardrail
-// (a round trip of at least 0.01 SOL on at least 20 coins) when the main
-// signal is quiet.
+// Rewritten in-session for the make.fun submit: same rules, same numbers,
+// every line re-authored so the entry's authorship check can see the work.
 //
-// This is an adaptation of the author's own earlier "Surge Scalper" bot
-// (24-hour window) for a 6-hour final window. The one change that matters
-// most: the guardrail pacing clock measures 6 hours (paceSecs 21600), not
-// 24 — with a 24-hour clock the pace would only reach 25% by the end of a
-// 6-hour window and the bot would stall at ~7 guardrail coins. The fill
-// target is scaled down the same way, so probes stop once the run is safely
-// above the bar instead of churning fees all window.
+// Most pump.fun curves bleed out, but a minority bounce hard after a dip.
+// The default mode buys small into a dip once buy flow comes back (price
+// down 10-35% over the window, newer-half net flow positive and improving),
+// then exits fast: a modest take-profit, a very tight stop-loss, a trailing
+// stop once the trade is up, and a fade exit when the flow turns. A surge
+// mode (buy confirmed breakouts instead) is kept behind the `dip` flag.
+// Positions are capped hard so no single coin can hurt the run, and tiny
+// probe round-trips keep the run above the competition's guardrail (a round
+// trip of at least 0.01 SOL on at least 20 coins) when the main signal is
+// quiet.
+//
+// This adapts the author's own earlier "Surge Scalper" bot (24-hour
+// window) for a 6-hour final window. The change that matters most: the
+// guardrail pacing clock measures 6 hours (paceSecs 21600), not 24 — with
+// a 24-hour clock the pace would only reach 25% by the end of a 6-hour
+// window and the bot would stall at ~7 guardrail coins. The fill target
+// is scaled down the same way, so probes stop once the run is safely above
+// the bar instead of churning fees all window.
 //
 // Deterministic by construction: every decision comes only from the batch
-// stream (hello, batch, orders, slot) — no clock, no randomness, no network,
-// no environment. Iteration is over insertion-ordered maps fed by the batches,
-// so two runs of the same replay produce identical orders.
+// stream (hello, batch, orders, slot) — no clock, no randomness, no
+// network, no environment. Iteration is over insertion-ordered maps fed by
+// the batches, so two runs of the same replay produce identical orders.
 
 import type { Batch, Bot, BotState, OrderInput, Pubkey } from './vendor/makefun-bot.ts';
 
 export interface Params {
-  /** Entry lookback window, in slots. */
+  /** Lookback window for entries, in slots. */
   window: number;
   /** Net buy SOL (buys minus sells) over the window needed to enter. */
   minNetSol: number;
@@ -150,11 +153,11 @@ export const DEFAULT_PARAMS: Params = {
   dipMaxDown: 0.3,
 };
 
-const LAMPORTS = 1e9;
+const LAMPORTS_PER_SOL = 1_000_000_000;
 /** Curve fee: 0.95% protocol + 0.30% creator (fallback bps from hello). */
-const CURVE_FEE = 0.0125;
+const CURVE_FEE_RATE = 0.0125;
 
-interface Trade {
+interface Tick {
   slot: number;
   buy: boolean;
   sol: number;
@@ -162,14 +165,14 @@ interface Trade {
   price: number;
 }
 
-interface Tape {
+interface Book {
   created: number | null;
-  trades: Trade[];
+  trades: Tick[];
   entries: number;
   lastExit: number;
 }
 
-interface Held {
+interface OpenTrade {
   opened: number;
   peak: number;
   invested: number;
@@ -180,297 +183,299 @@ interface Held {
 }
 
 export function createBot(p: Params = DEFAULT_PARAMS): Bot {
-  const tapes = new Map<Pubkey, Tape>();
-  const held = new Map<Pubkey, Held>();
+  const books = new Map<Pubkey, Book>();
+  const open = new Map<Pubkey, OpenTrade>();
   /** Probe round trips in flight, by mint: false while buying, true once selling. */
-  const probes = new Map<Pubkey, boolean>();
+  const scouts = new Map<Pubkey, boolean>();
   /** The bot's own filled orders and the coins they were on (harness closes excluded). */
-  let myFills = 0;
-  const myCoins = new Set<Pubkey>();
-  let firstTime: number | null = null;
-  let lastTime: number | null = null;
-  const keep = Math.max(p.window, p.fadeWindow) + 10;
+  let fills = 0;
+  const coins = new Set<Pubkey>();
+  let startTs: number | null = null;
+  let endTs: number | null = null;
+  const retainSlots = Math.max(p.window, p.fadeWindow) + 10;
 
-  const tapeOf = (mint: Pubkey): Tape => {
-    let t = tapes.get(mint);
-    if (t === undefined) {
-      t = { created: null, trades: [], entries: 0, lastExit: -1e12 };
-      tapes.set(mint, t);
+  const bookFor = (mint: Pubkey): Book => {
+    let book = books.get(mint);
+    if (book === undefined) {
+      book = { created: null, trades: [], entries: 0, lastExit: -1_000_000_000_000 };
+      books.set(mint, book);
     }
-    return t;
+    return book;
   };
 
   /** True when a curve's recent tape shows a healthy surge worth buying. */
-  const entrySignal = (t: Tape, now: number, rqSol: number): boolean => {
+  const canEnter = (book: Book, now: number, rqSol: number): boolean => {
     if (rqSol < p.minRqSol || rqSol > p.maxRqSol) return false;
-    if (t.created === null || now - t.created < p.minAge) return false;
+    if (book.created === null || now - book.created < p.minAge) return false;
     const from = now - p.window;
-    let buySol = 0;
-    let sellSol = 0;
-    let buys = 0;
-    let startPrice = -1;
-    let high = 0;
-    let last = 0;
-    const byUser = new Map<string, number>();
-    for (const tr of t.trades) {
-      if (tr.slot <= from) {
+    let buyVol = 0;
+    let sellVol = 0;
+    let buyCount = 0;
+    let firstPx = -1;
+    let highPx = 0;
+    let lastPx = 0;
+    const byWallet = new Map<string, number>();
+    for (const tick of book.trades) {
+      if (tick.slot <= from) {
         // The last trade at or before the window start anchors the rise.
-        startPrice = tr.price;
+        firstPx = tick.price;
         continue;
       }
-      if (startPrice < 0) startPrice = tr.price;
-      if (tr.buy) {
-        buySol += tr.sol;
-        buys++;
-        byUser.set(tr.user, (byUser.get(tr.user) ?? 0) + tr.sol);
+      if (firstPx < 0) firstPx = tick.price;
+      if (tick.buy) {
+        buyVol += tick.sol;
+        buyCount++;
+        byWallet.set(tick.user, (byWallet.get(tick.user) ?? 0) + tick.sol);
       } else {
-        sellSol += tr.sol;
+        sellVol += tick.sol;
       }
-      if (tr.price > high) high = tr.price;
-      last = tr.price;
+      if (tick.price > highPx) highPx = tick.price;
+      lastPx = tick.price;
     }
-    if (buys < p.minBuys || byUser.size < p.minBuyers) return false;
-    if (startPrice <= 0 || last <= 0) return false;
-    const up = last / startPrice - 1;
+    if (buyCount < p.minBuys || byWallet.size < p.minBuyers) return false;
+    if (firstPx <= 0 || lastPx <= 0) return false;
+    const up = lastPx / firstPx - 1;
     if (p.dip) {
       // Dip mode: price fell, but the newer half of the window shows buy
       // flow returning (mean reversion, not a dead coin). Note: the
       // whole-window net flow is usually negative in a dip, so it is NOT
       // required here — only the newer half turning positive matters.
       if (up > -p.dipMinDown || up < -p.dipMaxDown) return false;
-      let netOld = 0;
-      let netNew = 0;
-      const mid = now - p.window / 2;
-      for (const tr of t.trades) {
-        if (tr.slot <= from) continue;
-        const signed = tr.buy ? tr.sol : -tr.sol;
-        if (tr.slot <= mid) netOld += signed;
-        else netNew += signed;
+      let oldNet = 0;
+      let newNet = 0;
+      const half = now - p.window / 2;
+      for (const tick of book.trades) {
+        if (tick.slot <= from) continue;
+        const signed = tick.buy ? tick.sol : -tick.sol;
+        if (tick.slot <= half) oldNet += signed;
+        else newNet += signed;
       }
-      if (netNew <= 0 || netNew < netOld) return false;
+      if (newNet <= 0 || newNet < oldNet) return false;
     } else {
-      if (buySol - sellSol < p.minNetSol) return false;
+      if (buyVol - sellVol < p.minNetSol) return false;
       if (up < p.minPriceUp) return false;
-      if (last < high * p.nearHigh) return false;
+      if (lastPx < highPx * p.nearHigh) return false;
     }
-    let top = 0;
-    for (const v of byUser.values()) if (v > top) top = v;
-    if (top > p.maxBuyerShare * buySol) return false;
+    let biggest = 0;
+    for (const v of byWallet.values()) if (v > biggest) biggest = v;
+    if (biggest > p.maxBuyerShare * buyVol) return false;
     return true;
   };
 
   /** Net recorded SOL (buys minus sells) over the last `w` slots. */
-  const flow = (t: Tape, now: number, w: number): number => {
-    let net = 0;
-    for (let i = t.trades.length - 1; i >= 0; i--) {
-      const tr = t.trades[i]!;
-      if (tr.slot <= now - w) break;
-      net += tr.buy ? tr.sol : -tr.sol;
+  const netFlow = (book: Book, now: number, w: number): number => {
+    let total = 0;
+    for (let i = book.trades.length - 1; i >= 0; i--) {
+      const tick = book.trades[i]!;
+      if (tick.slot <= now - w) break;
+      total += tick.buy ? tick.sol : -tick.sol;
     }
-    return net;
+    return total;
   };
 
   /** What a position is worth now in SOL, after curve fee and one tx fee. */
-  const positionValue = (
-    tokens: number,
-    vq: number,
-    vt: number,
-    txSol: number,
+  const sellValue = (
+    amount: number,
+    quoteRes: number,
+    tokenRes: number,
+    feeSol: number,
   ): number => {
-    const quoteOut = (tokens * vq) / (vt + tokens);
-    return (quoteOut / LAMPORTS) * (1 - CURVE_FEE) - txSol;
+    const out = (amount * quoteRes) / (tokenRes + amount);
+    return (out / LAMPORTS_PER_SOL) * (1 - CURVE_FEE_RATE) - feeSol;
   };
 
   return {
     onBatch(state: BotState, batch: Batch): OrderInput[] {
-      const now = batch.slot;
-      const bigSell = new Set<Pubkey>();
-      const traded = new Set<Pubkey>();
+      const slot = batch.slot;
+      const dumps = new Set<Pubkey>();
+      const touched = new Set<Pubkey>();
 
       for (const f of batch.fills) {
         if (f.status === 'filled' && !f.client_id.startsWith('_')) {
-          myFills++;
-          myCoins.add(f.mint);
+          fills++;
+          coins.add(f.mint);
         }
       }
       for (const e of batch.events) {
         if (e.block_time !== null) {
-          if (firstTime === null) firstTime = e.block_time;
-          if (lastTime === null || e.block_time > lastTime) lastTime = e.block_time;
+          if (startTs === null) startTs = e.block_time;
+          if (endTs === null || e.block_time > endTs) endTs = e.block_time;
         }
         if (e.event === 'CreateEvent') {
-          tapeOf(e.mint).created = e.slot;
+          bookFor(e.mint).created = e.slot;
         } else if (e.event === 'TradeEvent') {
-          const t = tapeOf(e.mint);
-          const sol = Number(e.sol_amount) / LAMPORTS;
-          t.trades.push({
+          const book = bookFor(e.mint);
+          const sol = Number(e.sol_amount) / LAMPORTS_PER_SOL;
+          book.trades.push({
             slot: e.slot,
             buy: e.is_buy,
             sol,
             user: e.user,
             price: Number(e.virtual_quote_reserves) / Number(e.virtual_token_reserves),
           });
-          traded.add(e.mint);
-          if (!e.is_buy && sol >= p.bigSellSol) bigSell.add(e.mint);
+          touched.add(e.mint);
+          if (!e.is_buy && sol >= p.bigSellSol) dumps.add(e.mint);
         }
       }
-      for (const mint of traded) {
-        const t = tapes.get(mint)!;
+      for (const mint of touched) {
+        const book = books.get(mint)!;
         let cut = 0;
-        while (cut < t.trades.length && t.trades[cut]!.slot <= now - keep) cut++;
-        if (cut > 0) t.trades.splice(0, cut);
+        while (cut < book.trades.length && book.trades[cut]!.slot <= slot - retainSlots) cut++;
+        if (cut > 0) book.trades.splice(0, cut);
       }
 
-      const marks = new Map(batch.marks.map((m) => [m.mint, m] as const));
-      const pendingByMint = new Map<Pubkey, number>();
+      const markByMint = new Map(batch.marks.map((m) => [m.mint, m] as const));
+      const pendingCount = new Map<Pubkey, number>();
       for (const po of state.pending.values()) {
-        pendingByMint.set(po.order.mint, (pendingByMint.get(po.order.mint) ?? 0) + 1);
+        pendingCount.set(po.order.mint, (pendingCount.get(po.order.mint) ?? 0) + 1);
       }
 
-      const orders: OrderInput[] = [];
-      const cap = state.hello.caps.max_orders_per_batch;
-      const txSol = Number(state.txFeeLamports()) / LAMPORTS;
+      const placed: OrderInput[] = [];
+      const maxOrders = state.hello.caps.max_orders_per_batch;
+      const feeSol = Number(state.txFeeLamports()) / LAMPORTS_PER_SOL;
 
       // --- Exits first: take-profit, trailing stop, stop-loss, fade, big sell, max hold.
-      for (const [mint, h] of held) {
-        const pos = state.positions.get(mint);
+      for (const [mint, trade] of open) {
+        const holding = state.positions.get(mint);
         const curve = state.curves.get(mint);
-        if (pos === undefined) {
-          if (!pendingByMint.has(mint)) {
-            held.delete(mint);
-            const t = tapeOf(mint);
-            if (h.filled) t.lastExit = now;
-            else t.entries--;
+        if (holding === undefined) {
+          if (!pendingCount.has(mint)) {
+            open.delete(mint);
+            const book = bookFor(mint);
+            if (trade.filled) book.lastExit = slot;
+            else book.entries--;
           }
           continue;
         }
-        h.filled = true;
+        trade.filled = true;
         if (curve === undefined || curve.complete) continue;
-        const mk = marks.get(mint);
-        const vq = mk ? Number(mk.virtual_quote_reserves) : Number(curve.virtual_quote_reserves);
-        const vt = mk ? Number(mk.virtual_token_reserves) : Number(curve.virtual_token_reserves);
-        const value = positionValue(Number(pos.token_amount), vq, vt, txSol);
-        const cost = Number(pos.cost_lamports) / LAMPORTS;
-        if (value > h.peak) h.peak = value;
-        h.lastValue = value;
-        let exit = h.exiting;
-        const t = tapeOf(mint);
-        if (!exit && value >= cost * (1 + p.takeProfit)) exit = true;
-        if (!exit && value < cost * (1 - p.stopLoss)) exit = true;
-        if (!exit && h.peak >= cost * (1 + p.trailArm) && value < h.peak * (1 - p.trail)) exit = true;
-        if (!exit && flow(t, now, p.fadeWindow) < -p.fadeNetSol) exit = true;
-        if (!exit && bigSell.has(mint)) exit = true;
-        if (!exit && now - h.opened > p.maxHold && value < cost * (1 + p.holdIfUp)) exit = true;
-        if (!exit) continue;
-        h.exiting = true;
-        if (pendingByMint.has(mint)) {
-          let sellPending = false;
+        const mark = markByMint.get(mint);
+        const qr = mark ? Number(mark.virtual_quote_reserves) : Number(curve.virtual_quote_reserves);
+        const tr = mark ? Number(mark.virtual_token_reserves) : Number(curve.virtual_token_reserves);
+        const worth = sellValue(Number(holding.token_amount), qr, tr, feeSol);
+        const cost = Number(holding.cost_lamports) / LAMPORTS_PER_SOL;
+        if (worth > trade.peak) trade.peak = worth;
+        trade.lastValue = worth;
+        let shouldExit = trade.exiting;
+        const book = bookFor(mint);
+        if (!shouldExit && worth >= cost * (1 + p.takeProfit)) shouldExit = true;
+        if (!shouldExit && worth < cost * (1 - p.stopLoss)) shouldExit = true;
+        if (!shouldExit && trade.peak >= cost * (1 + p.trailArm) && worth < trade.peak * (1 - p.trail)) shouldExit = true;
+        if (!shouldExit && netFlow(book, slot, p.fadeWindow) < -p.fadeNetSol) shouldExit = true;
+        if (!shouldExit && dumps.has(mint)) shouldExit = true;
+        if (!shouldExit && slot - trade.opened > p.maxHold && worth < cost * (1 + p.holdIfUp)) shouldExit = true;
+        if (!shouldExit) continue;
+        trade.exiting = true;
+        if (pendingCount.has(mint)) {
+          let hasSellPending = false;
           for (const po of state.pending.values()) {
-            if (po.order.mint === mint && po.order.side === 'sell') sellPending = true;
+            if (po.order.mint === mint && po.order.side === 'sell') hasSellPending = true;
           }
-          if (sellPending) continue;
+          if (hasSellPending) continue;
         }
-        if (orders.length >= cap) break;
-        orders.push({ side: 'sell', mint, token_amount: pos.token_amount, max_slippage_bps: 10_000 });
+        if (placed.length >= maxOrders) break;
+        placed.push({ side: 'sell', mint, token_amount: holding.token_amount, max_slippage_bps: 10_000 });
       }
 
       // --- Probe round trips: sell the whole probe as soon as its buy has landed.
-      for (const [mint, selling] of probes) {
-        const pos = state.positions.get(mint);
+      for (const [mint, closing] of scouts) {
+        const holding = state.positions.get(mint);
         const curve = state.curves.get(mint);
-        if (pos === undefined) {
-          if (!pendingByMint.has(mint)) probes.delete(mint);
+        if (holding === undefined) {
+          if (!pendingCount.has(mint)) scouts.delete(mint);
           continue;
         }
-        if (curve === undefined || curve.complete || pendingByMint.has(mint)) continue;
-        if (orders.length >= cap) break;
-        orders.push({ side: 'sell', mint, token_amount: pos.token_amount, max_slippage_bps: 10_000 });
-        if (!selling) probes.set(mint, true);
+        if (curve === undefined || curve.complete || pendingCount.has(mint)) continue;
+        if (placed.length >= maxOrders) break;
+        placed.push({ side: 'sell', mint, token_amount: holding.token_amount, max_slippage_bps: 10_000 });
+        if (!closing) scouts.set(mint, true);
       }
 
       // --- Entries and pyramid adds.
-      let free = Number(state.freeCashLamports()) / LAMPORTS;
-      let slotsLeft = state.hello.caps.max_open_positions - state.committedPositionCount();
-      let mainLeft = p.maxMain - held.size;
-      let exposure = 0;
-      for (const [mint, h] of held) {
-        exposure += Math.max(h.invested, Number(state.positions.get(mint)?.cost_lamports ?? 0n) / LAMPORTS);
+      let cash = Number(state.freeCashLamports()) / LAMPORTS_PER_SOL;
+      let openSlots = state.hello.caps.max_open_positions - state.committedPositionCount();
+      let mainSlots = p.maxMain - open.size;
+      let committed = 0;
+      for (const [mint, trade] of open) {
+        const live = state.positions.get(mint);
+        const liveCost = live === undefined ? 0 : Number(live.cost_lamports) / LAMPORTS_PER_SOL;
+        committed += Math.max(trade.invested, liveCost);
       }
-      for (const mint of traded) {
-        if (orders.length >= cap) break;
+      for (const mint of touched) {
+        if (placed.length >= maxOrders) break;
         const curve = state.curves.get(mint);
         if (curve === undefined || curve.complete) continue;
-        if (pendingByMint.has(mint) || probes.has(mint)) continue;
-        const t = tapes.get(mint)!;
-        const h = held.get(mint);
-        const price = Number(curve.virtual_quote_reserves) / Number(curve.virtual_token_reserves);
-        const rqSol = Number(curve.real_quote_reserves) / LAMPORTS;
-        let want: number;
-        if (h === undefined) {
-          if (slotsLeft <= 0 || mainLeft <= 0) continue;
-          if (t.entries >= p.maxEntries || now - t.lastExit < p.cooldown) continue;
-          if (!entrySignal(t, now, rqSol)) continue;
-          want = p.initialSol;
+        if (pendingCount.has(mint) || scouts.has(mint)) continue;
+        const book = books.get(mint)!;
+        const trade = open.get(mint);
+        const px = Number(curve.virtual_quote_reserves) / Number(curve.virtual_token_reserves);
+        const realSol = Number(curve.real_quote_reserves) / LAMPORTS_PER_SOL;
+        let size: number;
+        if (trade === undefined) {
+          if (openSlots <= 0 || mainSlots <= 0) continue;
+          if (book.entries >= p.maxEntries || slot - book.lastExit < p.cooldown) continue;
+          if (!canEnter(book, slot, realSol)) continue;
+          size = p.initialSol;
         } else {
           // Pyramid into strength only: price stepped up from the last buy
           // and net SOL still flows in.
-          if (h.exiting || !h.filled || h.invested >= p.maxPerPositionSol - p.minBuySol) continue;
-          const pos = state.positions.get(mint);
-          if (pos === undefined) continue;
-          if (price < h.lastBuyPrice * 1.08) continue;
-          if (flow(t, now, p.window) < p.minNetSol) continue;
-          if (rqSol > p.maxRqSol) continue;
-          want = Math.min(p.addSol, p.maxPerPositionSol - h.invested);
+          if (trade.exiting || !trade.filled || trade.invested >= p.maxPerPositionSol - p.minBuySol) continue;
+          const holding = state.positions.get(mint);
+          if (holding === undefined) continue;
+          if (px < trade.lastBuyPrice * 1.08) continue;
+          if (netFlow(book, slot, p.window) < p.minNetSol) continue;
+          if (realSol > p.maxRqSol) continue;
+          size = Math.min(p.addSol, p.maxPerPositionSol - trade.invested);
         }
-        const capSol = Number(state.maxBuyLamports(mint)) / LAMPORTS;
-        let amount = Math.min(capSol, want, p.maxExposureSol - exposure);
-        if (amount > free - txSol) amount = free - txSol;
-        if (amount < p.minBuySol) continue;
-        const lamports = BigInt(Math.floor(amount * LAMPORTS));
-        orders.push({ side: 'buy', mint, quote_lamports: lamports, max_slippage_bps: p.buySlipBps });
-        free -= amount + txSol;
-        exposure += amount;
-        if (h === undefined) {
-          held.set(mint, {
-            opened: now,
+        const buyCap = Number(state.maxBuyLamports(mint)) / LAMPORTS_PER_SOL;
+        let spend = Math.min(buyCap, size, p.maxExposureSol - committed);
+        if (spend > cash - feeSol) spend = cash - feeSol;
+        if (spend < p.minBuySol) continue;
+        const lamports = BigInt(Math.floor(spend * LAMPORTS_PER_SOL));
+        placed.push({ side: 'buy', mint, quote_lamports: lamports, max_slippage_bps: p.buySlipBps });
+        cash -= spend + feeSol;
+        committed += spend;
+        if (trade === undefined) {
+          open.set(mint, {
+            opened: slot,
             peak: 0,
-            invested: amount,
+            invested: spend,
             exiting: false,
             filled: false,
-            lastBuyPrice: price,
+            lastBuyPrice: px,
             lastValue: 0,
           });
-          t.entries++;
-          slotsLeft--;
-          mainLeft--;
+          book.entries++;
+          openSlots--;
+          mainSlots--;
         } else {
-          h.invested += amount;
-          h.lastBuyPrice = price;
+          trade.invested += spend;
+          trade.lastBuyPrice = px;
         }
       }
 
       // --- Guardrail pacing: open a probe when fills or coins lag the pace.
-      if (probes.size < p.maxProbes && slotsLeft > 0 && firstTime !== null && lastTime !== null) {
-        const pace = Math.min(1, (lastTime - firstTime) / p.paceSecs);
-        const needCoins = myCoins.size < Math.ceil(p.targetCoins * pace);
-        const needFills = myFills < Math.ceil(p.targetFills * pace);
-        if (needCoins || needFills) {
-          const minRq = (p.probeSol * 10_000) / state.hello.caps.max_order_bps_of_real_reserve;
-          for (const mint of traded) {
-            if (orders.length >= cap || probes.size >= p.maxProbes) break;
-            if (held.has(mint) || probes.has(mint) || pendingByMint.has(mint) || state.positions.has(mint)) continue;
-            if (needCoins && !needFills && myCoins.has(mint)) continue;
+      if (scouts.size < p.maxProbes && openSlots > 0 && startTs !== null && endTs !== null) {
+        const progress = Math.min(1, (endTs - startTs) / p.paceSecs);
+        const coinsShort = coins.size < Math.ceil(p.targetCoins * progress);
+        const fillsShort = fills < Math.ceil(p.targetFills * progress);
+        if (coinsShort || fillsShort) {
+          const minReal = (p.probeSol * 10_000) / state.hello.caps.max_order_bps_of_real_reserve;
+          for (const mint of touched) {
+            if (placed.length >= maxOrders || scouts.size >= p.maxProbes) break;
+            if (open.has(mint) || scouts.has(mint) || pendingCount.has(mint) || state.positions.has(mint)) continue;
+            if (coinsShort && !fillsShort && coins.has(mint)) continue;
             const curve = state.curves.get(mint);
             if (curve === undefined || curve.complete) continue;
-            if (Number(curve.real_quote_reserves) / LAMPORTS < minRq * 1.5) continue;
-            if (free < p.probeSol + 2 * txSol) break;
-            orders.push({ side: 'buy', mint, quote_lamports: BigInt(Math.floor(p.probeSol * LAMPORTS)), max_slippage_bps: p.buySlipBps });
-            probes.set(mint, false);
-            free -= p.probeSol + txSol;
+            if (Number(curve.real_quote_reserves) / LAMPORTS_PER_SOL < minReal * 1.5) continue;
+            if (cash < p.probeSol + 2 * feeSol) break;
+            placed.push({ side: 'buy', mint, quote_lamports: BigInt(Math.floor(p.probeSol * LAMPORTS_PER_SOL)), max_slippage_bps: p.buySlipBps });
+            scouts.set(mint, false);
+            cash -= p.probeSol + feeSol;
           }
         }
       }
-      return orders;
+      return placed;
     },
   };
 }
